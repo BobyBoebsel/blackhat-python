@@ -6,19 +6,23 @@ import sys
 import textwrap
 import threading
 
+# Funktion zum Ausführen von Shell-Befehlen
 def execute(cmd):
     cmd = cmd.strip()
     if not cmd:
         return
-    output = subprocess.check_output(shlex.split(cmd), stderr=subprocess.STDOUT)
-    return output.decode()
+    try:
+        output = subprocess.check_output(shlex.split(cmd), stderr=subprocess.STDOUT)
+        return output.decode()
+    except Exception as e:
+        return f"Command failed: {e}"
 
 class NetCat:
     def __init__(self, args, buffer=None):
         self.args = args
         self.buffer = buffer
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-      
+
     def run(self):
         if self.args.listen:
             self.listen()
@@ -26,7 +30,11 @@ class NetCat:
             self.send()
 
     def send(self):
-        self.socket.connect((self.args.target, self.args.port))
+        try:
+            self.socket.connect((self.args.target, self.args.port))
+        except ConnectionRefusedError as e:
+            print(f"Connection failed: {e}")
+            sys.exit(1)
         if self.buffer:
             self.socket.send(self.buffer)
         try:
@@ -41,14 +49,19 @@ class NetCat:
                         break
                 if response:
                     print(response)
-                    buffer = input("")
+                    try:
+                        buffer = input("")  # Benutzereingabe
+                    except EOFError:  # EOF (Strg + D) abfangen
+                        print("No more input. Exiting.")
+                        break
                     buffer += "\n"
                     self.socket.send(buffer.encode())
         except KeyboardInterrupt:
             print("User terminated.")
+        finally:
             self.socket.close()
             sys.exit()
-    
+
     def listen(self):
         self.socket.bind((self.args.target, self.args.port))
         self.socket.listen(5)
@@ -57,40 +70,43 @@ class NetCat:
             client_socket, _ = self.socket.accept()
             client_thread = threading.Thread(target=self.handle, args=(client_socket,))
             client_thread.start()
-    
-    def handle(self):
-        if self.args.execute:
-            output = execute(self.args.execute)
-            self.socket.send(output.encode())
-        elif self.args.upload:
-            file_buffer = b""
-            while True:
-                data = self.socket.recv(4096)
-                if data:
-                    file_buffer += data
-                else:
-                    break
-            
-            with open(self.args.upload, "wb") as f:
-                f.write(file_buffer)
-            message = f"Saved file {self.args.upload}"
-            self.socket.send(message.encode())
-       
-        elif self.args.command:
-            cmd_buffer = b""
-            while True:
-                try:
-                    self.socket.send(b"BHP $ ")
-                    while "\n" not in cmd_buffer.decode():
-                        cmd_buffer += self.socket.recv(64)
-                    response = execute(cmd_buffer.decode())
-                    if response:
-                        self.socket.send(response.encode())
-                    cmd_buffer = b""
-                except Exception as e:
-                    print(f"Server killed {e}")
-                    self.socket.close()
-                    sys.exit()
+
+    def handle(self, client_socket):
+        try:
+            if self.args.execute:
+                output = execute(self.args.execute)
+                client_socket.send(output.encode())
+            elif self.args.upload:
+                file_buffer = b""
+                while True:
+                    data = client_socket.recv(4096)
+                    if data:
+                        file_buffer += data
+                    else:
+                        break
+                with open(self.args.upload, "wb") as f:
+                    f.write(file_buffer)
+                message = f"Saved file {self.args.upload}"
+                client_socket.send(message.encode())
+            elif self.args.command:
+                cmd_buffer = b""
+                while True:
+                    try:
+                        client_socket.send(b"BHP $ ")
+                        while "\n" not in cmd_buffer.decode():
+                            cmd_buffer += client_socket.recv(64)
+                        response = execute(cmd_buffer.decode())
+                        if response:
+                            client_socket.send(response.encode())
+                        cmd_buffer = b""
+                    except Exception as e:
+                        print(f"Error processing command: {e}")
+                        client_socket.send(f"Error: {e}\n".encode())
+        except Exception as e:
+            print(f"Unexpected error: {e}")
+        finally:
+            print("Closing client connection.")
+            client_socket.close()
 
 if __name__ == "__main__":
     print("NetCat Clone")
@@ -100,9 +116,9 @@ if __name__ == "__main__":
         epilog=textwrap.dedent('''Example:
         netcat_clone.py -t 192.168.1.108 -p 5555 -l -c # command shell
         netcat_clone.py -t 192.168.1.108 -p 5555 -l -u=mytest.txt # upload to file
-        netcat_clone.py -t 192.168.1.108 -p 5555 -l -e=\"cat /etc/passwd\" # execute command
-        echo 'ABC' | ./netcat_clone.py -t
-        netcat_clone.py -t 192.168.1.108 - p 5555 # connect to server
+        netcat_clone.py -t 192.168.1.108 -p 5555 -l -e="cat /etc/passwd" # execute command
+        echo 'ABC' | ./netcat_clone.py -t 192.168.1.108 -p 5555
+        netcat_clone.py -t 192.168.1.108 -p 5555 # connect to server
         '''))
     parser.add_argument("-c", "--command", action="store_true", help="command shell")
     parser.add_argument("-e", "--execute", help="execute specified command")
@@ -114,7 +130,10 @@ if __name__ == "__main__":
     if args.listen:
         buffer = ""
     else:
-        buffer = sys.stdin.read()
-    
-    nc=NetCat(args, buffer.encode())
+        try:
+            buffer = sys.stdin.read()
+        except EOFError:  # EOF (Strg + D) abfangen
+            buffer = ""
+
+    nc = NetCat(args, buffer.encode())
     nc.run()
